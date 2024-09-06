@@ -545,8 +545,7 @@ class RepobenchRetriever(Repobench):
         for subset_name, res in test_result.items():
 
             # get the language, and subset
-            language = subset_name.split("_")[0]
-            subset = subset_name.split("_")[-1].split(".")[0]
+            language, subset = subset_name.split("_")
 
             # test the easy retrieval
             gt, pred_3, pred_5, pred_10, pred_20, pred_30, pred_60, pred_120 = [], [], [], [], [], [], [], []
