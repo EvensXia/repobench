@@ -7,3 +7,4 @@ archive_data/test
 archive_data/train
 .vscode
 record
+*.png

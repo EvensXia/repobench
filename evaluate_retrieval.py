@@ -214,11 +214,11 @@ def main(
         except:
             pass
 
-    with open("record.json", "w") as f:
+    with open("record/record_unixcoder-base_jaccard.json", "w") as f:
         json.dump(record, f)
 
 
 if __name__ == '__main__':
     # import fire
     # fire.Fire(main)
-    main(dir="results/retrieval/unixcoder-base", print_random=True)
+    main(dir="results/retrieval/unixcoder-base_jaccard", print_random=True)

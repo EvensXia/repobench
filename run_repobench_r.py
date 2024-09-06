@@ -61,14 +61,6 @@ def main(
             model = AutoModel.from_pretrained(model_name, cache_dir="cache")
         model.to("cuda")
 
-    # mapping = {
-    #     "first": data_first,
-    #     "random": data_random
-    # }
-    # datasets[subset][task]
-    # tasks: list[str] = ["test_easy", "test_hard"],
-    #   subsets: list[str] = ["python_cff", "python_cfr"]):
-
     for subset_name, subset_data in datasets.items():
         logger.success(f"Processing {subset_name}")
         res: dict[str, list] = {}
@@ -105,7 +97,7 @@ if __name__ == "__main__":
     # import fire
     # fire.Fire(main)
     main(
-        similarity="jaccard",  # "edit", "jaccard", "cosine"
+        similarity="edit",  # "edit", "jaccard", "cosine"
         keep_lines=[3],
         model_name="microsoft/unixcoder-base",
         max_length=512
