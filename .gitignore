@@ -5,3 +5,5 @@ results
 /data_v1
 archive_data/test
 archive_data/train
+.vscode
+record

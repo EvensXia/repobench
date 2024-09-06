@@ -2,7 +2,8 @@ openai
 transformers
 torch
 fuzzywuzzy
-difflib
+# difflib # no need install in py312
 tqdm
 ctranslate2
 fire
+datasets
