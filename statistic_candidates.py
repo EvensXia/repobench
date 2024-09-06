@@ -17,12 +17,13 @@ def statistic(dataset: Dataset):
     return lines, counts
 
 
-def draw(data: list[int], filename: str, xlabel: str):
+def draw(data: list[int], filename: str, xlabel: str, log=False):
     plt.hist(data, bins=range(min(data), max(data) + 2), edgecolor='black')
     plt.xlabel(xlabel)
     plt.ylabel('Frequency')
     plt.title(f'Histogram of Data Distribution (average value = {np.mean(data)})')
-
+    if log:
+        plt.yscale('log')
     plt.savefig(f"statics/{filename}.png", format='png')
     plt.close()
 
@@ -34,7 +35,7 @@ def main():
         for task_name, task_set in subset_data.items():
             logger.success(f"In task {task_name}")
             lines, counts = statistic(task_set)
-            draw(lines, f"{subset_name}_{task_name}_lines", xlabel=f"{subset_name}_{task_name}_lines")
+            draw(lines, f"{subset_name}_{task_name}_lines", xlabel=f"{subset_name}_{task_name}_lines", log=True)
             draw(counts, f"{subset_name}_{task_name}_candidate_counts", xlabel=f"{subset_name}_{task_name}_candidate_counts")
 
 
