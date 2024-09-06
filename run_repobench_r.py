@@ -17,7 +17,7 @@ def load_data(dataset_path: str = "tianyang/repobench-r",
               subsets: list[str] = ["python_cff", "python_cfr"]) -> dict[str, dict[str, Dataset]]:
     datasets = {}
     for subset in subsets:
-        dataset = load_dataset(dataset_path, subset, ignore_verifications=True, verification_mode="no_checks")
+        dataset = load_dataset(dataset_path, subset, verification_mode="no_checks")
         datasets[subset] = {}
         for task in tasks:
             datasets[subset][task] = dataset[task]

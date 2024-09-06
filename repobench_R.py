@@ -1,7 +1,8 @@
+import random
+import sys
 from dataclasses import dataclass
 # NOTE: if in py311 or lower, should install with `python -m pip install difflib`
 from difflib import SequenceMatcher
-import random
 
 import torch
 import torch.nn as nn
@@ -28,44 +29,13 @@ def crop_code_lines(code: str | list[str], threshold: int) -> str | list[str]:  
         return code
 
 
-def accuracy_at_k(prediction_list, golden_index_list, k):
-    """
-    This function computes the accuracy at k. It returns a float value between 0 and 1 indicating the
-    accuracy at k, where a value of 1 means the correct code is retrieved at the top k positions and
-    a value of 0 means the correct code is not retrieved at the top k positions.
-
-    Args:
-    prediction_list: list, a list of lists, where each list contains the indices of the retrieved codes.
-    golden_index_list: list, a list of integers, where each integer is the index of the correct code.
-    k: int, the number of retrieved codes.
-
-    Returns:
-    Float, the accuracy at k.
-    """
-
-    if len(golden_index_list) == 0:
+def accuracy_at_k(prediction_list: list[list[int]], golden_index_list: list[int], k: int) -> float:  # simplified from source repo
+    if not golden_index_list:
         raise ValueError("The list of golden indices should not be empty.")
-
-    assert len(golden_index_list) == len(prediction_list), \
-        "The length of the golden indices list should be equal to the length of the prediction list, however, " \
-        f"the length of the golden indices list is {len(golden_index_list)} and the length of the prediction list is {
-        len(prediction_list)}."
-
-    acc = 0
-
-    for i in range(len(prediction_list)):
-        golden_index = golden_index_list[i]
-        index_list = prediction_list[i]
-
-        if len(index_list) < k:
-            raise ValueError("The number of retrieved codes should be greater than k.")
-
-        top_k_indices = index_list[:k]
-
-        if golden_index not in top_k_indices:
-            continue
-        else:
-            acc += 1
+    if len(golden_index_list) != len(prediction_list):
+        raise ValueError(f"Golden indices list and prediction list must have the same length, got {
+                         len(golden_index_list)} and {len(prediction_list)}.")
+    acc = sum(1 for i, index_list in enumerate(prediction_list) if golden_index_list[i] in index_list[:k])
 
     return round(acc / len(golden_index_list), 5)
 
@@ -95,14 +65,14 @@ class UniXcoder(nn.Module):
         self.tokenizer.add_tokens(["<mask0>"], special_tokens=True)
 
     def tokenize(self, inputs, mode="<encoder-only>", max_length=512, padding=False):
-        """ 
-        Convert string to token ids 
+        """
+        Convert string to token ids
 
         Parameters:
 
         * `inputs`- list of input strings.
         * `max_length`- The maximum total source sequence length after tokenization.
-        * `padding`- whether to pad source sequence length to max_length. 
+        * `padding`- whether to pad source sequence length to max_length.
         * `mode`- which mode the sequence will use. i.e. <encoder-only>, <decoder-only>, <encoder-decoder>
         """
         assert mode in ["<encoder-only>", "<decoder-only>", "<encoder-decoder>"]
@@ -407,6 +377,9 @@ class CosineSimilarityBase(Similarity):
         sim_scores = []
         for i, candidate_embedding in enumerate(candidates_embeddings):
             sim_scores.append((i, self.similarity(code_embedding, candidate_embedding)))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        ranks = [index for index, score in sim_scores]
+        return ranks
 
     def similarity(self, embedding1: torch.Tensor, embedding2: torch.Tensor) -> float:
         # check the input to be tensor
@@ -471,42 +444,74 @@ class UnixcoderSimilarity(CosineSimilarityBase):
         return code_embeddings
 
 
+class VoyageSimilarity(Similarity):
+    def __init__(self, api_key: str, model: str = "voyage-code-2") -> None:
+        try:
+            import voyageai
+        except ImportError:
+            logger.error("using `python -m pip install voyageai` at first")
+            sys.exit(1)
+        self.vo = voyageai.Client(api_key)
+        self.model = model
+
+    def retrieve(self, code: str, candidates: list[str]) -> list[int]:
+        embeddings = self.vo.embed([code, *candidates], model=self.model).embeddings
+        code_embedding: list[float] = embeddings[0]
+        candidates_embeddings: list[list[float]] = embeddings[1:]
+        sim_scores = []
+        for i, candidate_embedding in enumerate(candidates_embeddings):
+            sim_scores.append((i, self.similarity(code_embedding, candidate_embedding)))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        ranks = [index for index, score in sim_scores]
+        return ranks
+
+    def similarity(self, embedding1: list[float], embedding2: list[float]) -> float:
+        return torch.cosine_similarity(torch.tensor(embedding1), torch.tensor(embedding2), dim=0).item()
+
+
 class Repobench:
+    def _get_languages(self): raise NotImplementedError
+
     def __init__(self, subsets: list[str], tasks: list[str], dataset_path: str) -> None:
         self.subsets: list[str] = subsets
         self.tasks: list[str] = tasks
         self.dataset_path: str = dataset_path
 
         self.datasets: dict[str, dict[str, Dataset]] = {}
+        self.languages: list[str] = self._get_languages()
 
     def load_dataset(self):
         for subset in self.subsets:
-            dataset = load_dataset(self.dataset_path, subset, ignore_verifications=True, verification_mode="no_checks")
+            logger.info(f"loading dataset `{self.dataset_path} | {subset}`")
+            dataset = load_dataset(self.dataset_path, subset, verification_mode="no_checks")
             self.datasets[subset] = {}
             for task in self.tasks:
                 self.datasets[subset][task] = dataset[task]
 
-    def retrieve_test(self) -> dict[str, dict[str, list]]: raise NotImplementedError
+    def retrieve_test(self, settings: Settings, similarity: Similarity) -> dict[str, dict[str, list]]: raise NotImplementedError
 
     def retrieve_eval(self, test_result: dict[str, dict[str, list]], print_random: bool) -> dict: raise NotImplementedError
 
 
 class RepobenchRetriever(Repobench):
+    def _get_languages(self): return ["python"]  # use `python` only
+
     def __init__(self) -> None:
         super().__init__(["python_cff", "python_cfr"],
                          ["test_easy", "test_hard"],
                          "tianyang/repobench-r")
 
     def retrieve_test(self, settings: Settings, similarity: Similarity) -> dict[str, dict[str, list]]:
+        logger.info(f"retrieve in settings: {settings}, similarity using `{similarity.__class__.__name__}`")
         all_result: dict[str, dict[str, list]] = {}
         for subset_name, subset_data in self.datasets.items():
-            logger.success(f"Processing {subset_name}")
+            logger.success(f"Processing `{subset_name}`")
             res: dict[str, list] = {}
             i = 0
             for task_name, task_set in subset_data.items():
-                logger.success(f"In task {task_name}")
+                logger.success(f"In task `{task_name}`")
                 res[task_name] = []
-                for dic in tqdm(task_set, desc=f"running {task_name}"):
+                for dic in tqdm(task_set, desc=f"running at {task_name}"):
                     res_dic = {}
                     for i in settings.keep_lines:
                         code = crop_code_lines(dic['code'], i)
@@ -518,213 +523,115 @@ class RepobenchRetriever(Repobench):
         return all_result
 
     def retrieve_eval(self, test_result: dict[str, dict[str, list]], print_random: bool = True) -> dict:
-        record = {
-            'python': {
-                'cff': {
-                    'test_easy': {},
-                    'test_hard': {}
-                },
-                'cfr': {
-                    'test_easy': {},
-                    'test_hard': {}
-                }
-            },
-            'java': {
-                'cff': {
-                    'test_easy': {},
-                    'test_hard': {}
-                },
-                'cfr': {
-                    'test_easy': {},
-                    'test_hard': {}
-                }
-            }
-        }
+        record = self.__initialize_record()
 
-        # loop through the files
+        # loop through the datasets
         for subset_name, res in test_result.items():
-
-            # get the language, and subset
             language, subset = subset_name.split("_")
 
-            # test the easy retrieval
-            gt, pred_3, pred_5, pred_10, pred_20, pred_30, pred_60, pred_120 = [], [], [], [], [], [], [], []
-            # create a list with 10 empty lists
-            rd = [[] for _ in range(100)]
-            for res_dic in res['test_easy']:
-                gt.append(res_dic['ground_truth'])
-                if print_random:
-                    for i in range(100):
-                        rdm_get = list(range(len(res_dic['3'])))
-                        random.shuffle(rdm_get)
-                        rd[i].append(rdm_get)
-                if '3' in res_dic:
-                    pred_3.append(res_dic['3'])
-                if '5' in res_dic:
-                    pred_5.append(res_dic['5'])
-                if '10' in res_dic:
-                    pred_10.append(res_dic['10'])
-                if '20' in res_dic:
-                    pred_20.append(res_dic['20'])
-                if '30' in res_dic:
-                    pred_30.append(res_dic['30'])
-                if '60' in res_dic:
-                    pred_60.append(res_dic['60'])
-                if '120' in res_dic:
-                    pred_120.append(res_dic['120'])
+            # Process test_easy and test_hard datasets
+            for test_type in ['test_easy', 'test_hard']:
+                self.__process_test(res[test_type], record, language, subset, test_type, print_random)
 
-            # # average of the 10 random lists
-            if print_random:
-                easy_rd_acc_at_1, easy_rd_acc_at_3 = [], []
-                for i in range(100):
-                    easy_rd_acc_at_1.append(accuracy_at_k(prediction_list=rd[i], golden_index_list=gt, k=1)*100)
-                    easy_rd_acc_at_3.append(accuracy_at_k(prediction_list=rd[i], golden_index_list=gt, k=3)*100)
-
-                # # average of the 10 random lists
-                easy_rd_acc_at_1 = sum(easy_rd_acc_at_1)/len(easy_rd_acc_at_1)
-                easy_rd_acc_at_3 = sum(easy_rd_acc_at_3)/len(easy_rd_acc_at_3)
-                record[language][subset]['test_easy']['rd'] = [easy_rd_acc_at_1, easy_rd_acc_at_3]
-
-            if '3' in res_dic:
-                easy_3_acc_at_1 = accuracy_at_k(prediction_list=pred_3, golden_index_list=gt, k=1)*100
-                easy_3_acc_at_3 = accuracy_at_k(prediction_list=pred_3, golden_index_list=gt, k=3)*100
-                record[language][subset]['test_easy']['3'] = [easy_3_acc_at_1, easy_3_acc_at_3]
-            if '5' in res_dic:
-                easy_5_acc_at_1 = accuracy_at_k(prediction_list=pred_5, golden_index_list=gt, k=1)*100
-                easy_5_acc_at_3 = accuracy_at_k(prediction_list=pred_5, golden_index_list=gt, k=3)*100
-                record[language][subset]['test_easy']['5'] = [easy_5_acc_at_1, easy_5_acc_at_3]
-            if '10' in res_dic:
-                easy_10_acc_at_1 = accuracy_at_k(prediction_list=pred_10, golden_index_list=gt, k=1)*100
-                easy_10_acc_at_3 = accuracy_at_k(prediction_list=pred_10, golden_index_list=gt, k=3)*100
-                record[language][subset]['test_easy']['10'] = [easy_10_acc_at_1, easy_10_acc_at_3]
-            if '20' in res_dic:
-                easy_20_acc_at_1 = accuracy_at_k(prediction_list=pred_20, golden_index_list=gt, k=1)*100
-                easy_20_acc_at_3 = accuracy_at_k(prediction_list=pred_20, golden_index_list=gt, k=3)*100
-                record[language][subset]['test_easy']['20'] = [easy_20_acc_at_1, easy_20_acc_at_3]
-            if '30' in res_dic:
-                easy_30_acc_at_1 = accuracy_at_k(prediction_list=pred_30, golden_index_list=gt, k=1)*100
-                easy_30_acc_at_3 = accuracy_at_k(prediction_list=pred_30, golden_index_list=gt, k=3)*100
-                record[language][subset]['test_easy']['30'] = [easy_30_acc_at_1, easy_30_acc_at_3]
-            if '60' in res_dic:
-                easy_60_acc_at_1 = accuracy_at_k(prediction_list=pred_60, golden_index_list=gt, k=1)*100
-                easy_60_acc_at_3 = accuracy_at_k(prediction_list=pred_60, golden_index_list=gt, k=3)*100
-                record[language][subset]['test_easy']['60'] = [easy_60_acc_at_1, easy_60_acc_at_3]
-            if '120' in res_dic:
-                easy_120_acc_at_1 = accuracy_at_k(prediction_list=pred_120, golden_index_list=gt, k=1)*100
-                easy_120_acc_at_3 = accuracy_at_k(prediction_list=pred_120, golden_index_list=gt, k=3)*100
-                record[language][subset]['test_easy']['120'] = [easy_120_acc_at_1, easy_120_acc_at_3]
-
-            # test the hard dataset
-            gt, pred_3, pred_5, pred_10, pred_20, pred_30, pred_60, pred_120 = [], [], [], [], [], [], [], []
-            rd = [[] for _ in range(100)]
-            for res_dic in res['test_hard']:
-                gt.append(res_dic['ground_truth'])
-                if print_random:
-                    for i in range(100):
-                        rdm_get = list(range(len(res_dic['3'])))
-                        random.shuffle(rdm_get)
-                        rd[i].append(rdm_get)
-                if '3' in res_dic:
-                    pred_3.append(res_dic['3'])
-                if '5' in res_dic:
-                    pred_5.append(res_dic['5'])
-                if '10' in res_dic:
-                    pred_10.append(res_dic['10'])
-                if '20' in res_dic:
-                    pred_20.append(res_dic['20'])
-                if '30' in res_dic:
-                    pred_30.append(res_dic['30'])
-                if '60' in res_dic:
-                    pred_60.append(res_dic['60'])
-                if '120' in res_dic:
-                    pred_120.append(res_dic['120'])
-
-            # # average of the 10 random lists
-
-            if print_random:
-                hard_rd_acc_at_1, hard_rd_acc_at_3, hard_rd_acc_at_5 = [], [], []
-                for i in range(100):
-                    hard_rd_acc_at_1.append(accuracy_at_k(prediction_list=rd[i], golden_index_list=gt, k=1)*100)
-                    hard_rd_acc_at_3.append(accuracy_at_k(prediction_list=rd[i], golden_index_list=gt, k=3)*100)
-                    hard_rd_acc_at_5.append(accuracy_at_k(prediction_list=rd[i], golden_index_list=gt, k=5)*100)
-
-                hard_rd_acc_at_1 = sum(hard_rd_acc_at_1)/len(hard_rd_acc_at_1)
-                hard_rd_acc_at_3 = sum(hard_rd_acc_at_3)/len(hard_rd_acc_at_3)
-                hard_rd_acc_at_5 = sum(hard_rd_acc_at_5)/len(hard_rd_acc_at_5)
-                record[language][subset]['test_hard']['rd'] = [hard_rd_acc_at_1, hard_rd_acc_at_3, hard_rd_acc_at_5]
-
-            if '3' in res_dic:
-                hard_3_acc_at_1 = accuracy_at_k(prediction_list=pred_3, golden_index_list=gt, k=1)*100
-                hard_3_acc_at_3 = accuracy_at_k(prediction_list=pred_3, golden_index_list=gt, k=3)*100
-                hard_3_acc_at_5 = accuracy_at_k(prediction_list=pred_3, golden_index_list=gt, k=5)*100
-                record[language][subset]['test_hard']['3'] = [hard_3_acc_at_1, hard_3_acc_at_3, hard_3_acc_at_5]
-            if '5' in res_dic:
-                hard_5_acc_at_1 = accuracy_at_k(prediction_list=pred_5, golden_index_list=gt, k=1)*100
-                hard_5_acc_at_3 = accuracy_at_k(prediction_list=pred_5, golden_index_list=gt, k=3)*100
-                hard_5_acc_at_5 = accuracy_at_k(prediction_list=pred_5, golden_index_list=gt, k=5)*100
-                record[language][subset]['test_hard']['5'] = [hard_5_acc_at_1, hard_5_acc_at_3, hard_5_acc_at_5]
-            if '10' in res_dic:
-                hard_10_acc_at_1 = accuracy_at_k(prediction_list=pred_10, golden_index_list=gt, k=1)*100
-                hard_10_acc_at_3 = accuracy_at_k(prediction_list=pred_10, golden_index_list=gt, k=3)*100
-                hard_10_acc_at_5 = accuracy_at_k(prediction_list=pred_10, golden_index_list=gt, k=5)*100
-                record[language][subset]['test_hard']['10'] = [hard_10_acc_at_1, hard_10_acc_at_3, hard_10_acc_at_5]
-            if '20' in res_dic:
-                hard_20_acc_at_1 = accuracy_at_k(prediction_list=pred_20, golden_index_list=gt, k=1)*100
-                hard_20_acc_at_3 = accuracy_at_k(prediction_list=pred_20, golden_index_list=gt, k=3)*100
-                hard_20_acc_at_5 = accuracy_at_k(prediction_list=pred_20, golden_index_list=gt, k=5)*100
-                record[language][subset]['test_hard']['20'] = [hard_20_acc_at_1, hard_20_acc_at_3, hard_20_acc_at_5]
-            if '30' in res_dic:
-                hard_30_acc_at_1 = accuracy_at_k(prediction_list=pred_30, golden_index_list=gt, k=1)*100
-                hard_30_acc_at_3 = accuracy_at_k(prediction_list=pred_30, golden_index_list=gt, k=3)*100
-                hard_30_acc_at_5 = accuracy_at_k(prediction_list=pred_30, golden_index_list=gt, k=5)*100
-                record[language][subset]['test_hard']['30'] = [hard_30_acc_at_1, hard_30_acc_at_3, hard_30_acc_at_5]
-            if '60' in res_dic:
-                hard_60_acc_at_1 = accuracy_at_k(prediction_list=pred_60, golden_index_list=gt, k=1)*100
-                hard_60_acc_at_3 = accuracy_at_k(prediction_list=pred_60, golden_index_list=gt, k=3)*100
-                hard_60_acc_at_5 = accuracy_at_k(prediction_list=pred_60, golden_index_list=gt, k=5)*100
-                record[language][subset]['test_hard']['60'] = [hard_60_acc_at_1, hard_60_acc_at_3, hard_60_acc_at_5]
-            if '120' in res_dic:
-                hard_120_acc_at_1 = accuracy_at_k(prediction_list=pred_120, golden_index_list=gt, k=1)*100
-                hard_120_acc_at_3 = accuracy_at_k(prediction_list=pred_120, golden_index_list=gt, k=3)*100
-                hard_120_acc_at_5 = accuracy_at_k(prediction_list=pred_120, golden_index_list=gt, k=5)*100
-                record[language][subset]['test_hard']['120'] = [hard_120_acc_at_1, hard_120_acc_at_3, hard_120_acc_at_5]
-
-        # print latex
-        print("Python")
-        # print rd as baseline
-        if 'rd' in record['python']['cff']['test_easy']:
-            print(f" rd & {record['python']['cff']['test_easy']['rd'][0]:.2f} & {record['python']['cff']['test_easy']['rd'][1]:.2f} & {record['python']['cfr']['test_easy']['rd'][0]:.2f} & {record['python']['cfr']['test_easy']['rd'][1]:.2f} & {record['python']['cff']['test_hard']['rd'][0]:.2f} & {
-                record['python']['cff']['test_hard']['rd'][1]:.2f} & {record['python']['cff']['test_hard']['rd'][2]:.2f}& {record['python']['cfr']['test_hard']['rd'][0]:.2f} & {record['python']['cfr']['test_hard']['rd'][1]:.2f} & {record['python']['cfr']['test_hard']['rd'][2]:.2f} \\\\")
-        for i in [3, 5, 10, 20, 30, 60, 120]:
-            try:
-                print(f"&{i} & {record['python']['cff']['test_easy'][str(i)][0]:.2f} & {record['python']['cff']['test_easy'][str(i)][1]:.2f} & {record['python']['cfr']['test_easy'][str(i)][0]:.2f} & {record['python']['cfr']['test_easy'][str(i)][1]:.2f} & {record['python']['cff']['test_hard'][str(i)][0]:.2f} & {
-                    record['python']['cff']['test_hard'][str(i)][1]:.2f} & {record['python']['cff']['test_hard'][str(i)][2]:.2f}& {record['python']['cfr']['test_hard'][str(i)][0]:.2f} & {record['python']['cfr']['test_hard'][str(i)][1]:.2f} & {record['python']['cfr']['test_hard'][str(i)][2]:.2f} \\\\")
-            except:
-                pass
-
-        print("Java")
-        # print rd as baseline
-        if 'rd' in record['java']['cff']['test_easy']:
-            print(f" rd & {record['java']['cff']['test_easy']['rd'][0]:.2f} & {record['java']['cff']['test_easy']['rd'][1]:.2f} & {record['java']['cfr']['test_easy']['rd'][0]:.2f} & {record['java']['cfr']['test_easy']['rd'][1]:.2f} & {record['java']['cff']['test_hard']['rd'][0]:.2f} & {
-                record['java']['cff']['test_hard']['rd'][1]:.2f} & {record['java']['cff']['test_hard']['rd'][2]:.2f}& {record['java']['cfr']['test_hard']['rd'][0]:.2f} & {record['java']['cfr']['test_hard']['rd'][1]:.2f} & {record['java']['cfr']['test_hard']['rd'][2]:.2f} \\\\")
-        for i in [3, 5, 10, 20, 30, 60, 120]:
-            try:
-                print(f"&{i} & {record['java']['cff']['test_easy'][str(i)][0]:.2f} & {record['java']['cff']['test_easy'][str(i)][1]:.2f} & {record['java']['cfr']['test_easy'][str(i)][0]:.2f} & {record['java']['cfr']['test_easy'][str(i)][1]:.2f} & {record['java']['cff']['test_hard'][str(i)][0]:.2f} & {
-                    record['java']['cff']['test_hard'][str(i)][1]:.2f} & {record['java']['cff']['test_hard'][str(i)][2]:.2f}& {record['java']['cfr']['test_hard'][str(i)][0]:.2f} & {record['java']['cfr']['test_hard'][str(i)][1]:.2f} & {record['java']['cfr']['test_hard'][str(i)][2]:.2f} \\\\")
-            except:
-                pass
-
+        self.__print_latex_results(record)
         return record
+
+    def __initialize_record(self) -> dict:
+        return {lang: {'cff': {'test_easy': {}, 'test_hard': {}},
+                       'cfr': {'test_easy': {}, 'test_hard': {}}}
+                for lang in self.languages}
+
+    def __process_test(self, results, record, language, subset, test_type, print_random):
+        gt, preds = [], {k: [] for k in ['3', '5', '10', '20', '30', '60', '120']}
+        rd = [[] for _ in range(100)]
+
+        for res_dic in results:
+            gt.append(res_dic['ground_truth'])
+            if print_random:
+                for i in range(100):
+                    rdm_get = list(range(len(res_dic['3'])))
+                    random.shuffle(rdm_get)
+                    rd[i].append(rdm_get)
+            for k in preds.keys():
+                if k in res_dic:
+                    preds[k].append(res_dic[k])
+
+        if print_random:
+            self.__calculate_random_accuracy(rd, gt, record, language, subset, test_type)
+
+        self.__calculate_accuracies(preds, gt, record, language, subset, test_type)
+
+    def __calculate_random_accuracy(self, rd, gt, record, language, subset, test_type):
+        rd_acc_at_1, rd_acc_at_3, rd_acc_at_5 = [], [], []
+        for i in range(100):
+            rd_acc_at_1.append(accuracy_at_k(rd[i], gt, k=1) * 100)
+            rd_acc_at_3.append(accuracy_at_k(rd[i], gt, k=3) * 100)
+            if test_type == "test_hard":
+                rd_acc_at_5.append(accuracy_at_k(rd[i], gt, k=5) * 100)
+        if test_type == "test_hard":
+            rd_accs = [
+                sum(rd_acc_at_1) / len(rd_acc_at_1),
+                sum(rd_acc_at_3) / len(rd_acc_at_3),
+                sum(rd_acc_at_5) / len(rd_acc_at_5)
+            ]
+        else:
+            rd_accs = [
+                sum(rd_acc_at_1) / len(rd_acc_at_1),
+                sum(rd_acc_at_3) / len(rd_acc_at_3)
+            ]
+        record[language][subset][test_type]['rd'] = rd_accs
+
+    def __calculate_accuracies(self, preds, gt, record, language, subset, test_type):
+        for k, pred_list in preds.items():
+            if pred_list:
+                acc_at_1 = accuracy_at_k(pred_list, gt, k=1) * 100
+                acc_at_3 = accuracy_at_k(pred_list, gt, k=3) * 100
+                if test_type == "test_hard":
+                    acc_at_5 = accuracy_at_k(pred_list, gt, k=5) * 100
+                    rec = [acc_at_1, acc_at_3, acc_at_5]
+                else:
+                    rec = [acc_at_1, acc_at_3]
+                record[language][subset][test_type][k] = rec
+
+    def __print_latex_results(self, record):
+        for language in self.languages:
+            logger.success(language.capitalize())
+            if 'rd' in record[language]['cff']['test_easy']:
+                prints = [*record[language]['cff']['test_easy']['rd'],
+                          *record[language]['cfr']['test_easy']['rd'],
+                          *record[language]['cff']['test_hard']['rd'],
+                          *record[language]['cfr']['test_hard']['rd']]
+                prints = [f"{i:.2f}" for i in prints]
+                logger.success(f"rd & {' & '.join(prints)}")
+            for i in ['3', '5', '10', '20', '30', '60', '120']:
+                try:
+                    prints = [*record[language]['cff']['test_easy'][i],
+                              *record[language]['cfr']['test_easy'][i],
+                              *record[language]['cff']['test_hard'][i],
+                              *record[language]['cfr']['test_hard'][i]]
+                    prints = [f"{i:.2f}" for i in prints]
+                    logger.success(f"&{i} & {' & '.join(prints)}")
+                except:
+                    ...
 
 
 def demo():
     settings = Settings(keep_lines=[3])
     # similarity = EditSimilarity()  # using "Salesforce/codegen-350M-multi" tokenizer
     # similarity = JaccardSimilarity()  # using "Salesforce/codegen-350M-multi" tokenizer
+    # similarity = VoyageSimilarity(api_key="", model="voyage-code-2")
     similarity = UnixcoderSimilarity(model_name="microsoft/unixcoder-base", device="cuda")
     benchmark = RepobenchRetriever()
+    benchmark.load_dataset()
     test_result = benchmark.retrieve_test(settings, similarity)
+    import json
+    with open("results/retrieval/unixcoder-base_cosine/python.json", "w") as f:
+        json.dump(test_result, f)
+    del test_result
+    with open("results/retrieval/unixcoder-base_cosine/python.json", "r") as f:
+        test_result = json.load(f)
     eval_result = benchmark.retrieve_eval(test_result, print_random=True)
+    logger.success(eval_result)
 
 
 if __name__ == "__main__":
