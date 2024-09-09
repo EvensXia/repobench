@@ -1,3 +1,6 @@
+import hashlib
+import os
+import pickle
 import random
 import sys
 from dataclasses import dataclass
@@ -445,7 +448,7 @@ class UnixcoderSimilarity(CosineSimilarityBase):
 
 
 class VoyageSimilarity(Similarity):
-    def __init__(self, api_key: str, model: str = "voyage-code-2") -> None:
+    def __init__(self, api_key: str, model: str = "voyage-code-2", cache_file: str = "/tmp/voyage_lru.pkl", save_frequency: int = 200) -> None:
         try:
             import voyageai
         except ImportError:
@@ -453,8 +456,36 @@ class VoyageSimilarity(Similarity):
             sys.exit(1)
         self.vo = voyageai.Client(api_key)
         self.model = model
+        self.cache_file = cache_file
+        self.cache = self._load_cache()
+        self.call_count = 0
+        self.save_frequency = save_frequency
+
+    def _generate_cache_key(self, code: str, candidates: list[str]) -> str:
+        key = code + ''.join(candidates)
+        return hashlib.md5(key.encode()).hexdigest()
+
+    def _load_cache(self) -> dict:
+        if os.path.exists(self.cache_file):
+            with open(self.cache_file, 'rb') as f:
+                try:
+                    return pickle.load(f)
+                except (EOFError, pickle.UnpicklingError):
+                    logger.warning("Failed to load cache file, starting with an empty cache.")
+                    return {}
+        else:
+            return {}
+
+    def _save_cache(self) -> None:
+        with open(self.cache_file, 'wb') as f:
+            pickle.dump(self.cache, f)
 
     def retrieve(self, code: str, candidates: list[str]) -> list[int]:
+        cache_key = self._generate_cache_key(code, candidates)
+        if cache_key in self.cache:
+            logger.info("Cache hit")
+            return self.cache[cache_key]
+
         embeddings = self.vo.embed([code, *candidates], model=self.model).embeddings
         code_embedding: list[float] = embeddings[0]
         candidates_embeddings: list[list[float]] = embeddings[1:]
@@ -463,6 +494,15 @@ class VoyageSimilarity(Similarity):
             sim_scores.append((i, self.similarity(code_embedding, candidate_embedding)))
         sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
         ranks = [index for index, score in sim_scores]
+
+        self.cache[cache_key] = ranks
+        self.call_count += 1
+
+        if self.call_count >= self.save_frequency:
+            logger.info(f"Saving cache to {self.cache_file} after {self.save_frequency} calls")
+            self._save_cache()
+            self.call_count = 0
+
         return ranks
 
     def similarity(self, embedding1: list[float], embedding2: list[float]) -> float:
@@ -619,16 +659,19 @@ def demo():
     settings = Settings(keep_lines=[3])
     # similarity = EditSimilarity()  # using "Salesforce/codegen-350M-multi" tokenizer
     # similarity = JaccardSimilarity()  # using "Salesforce/codegen-350M-multi" tokenizer
-    # similarity = VoyageSimilarity(api_key="", model="voyage-code-2")
-    similarity = UnixcoderSimilarity(model_name="microsoft/unixcoder-base", device="cuda")
+    similarity = VoyageSimilarity(api_key="pa-Iij_g89x-bEwr0KXcFuW8gFoqyDVXZ_DZggOKiZROUY",
+                                  model="voyage-code-2",
+                                  cache_file="/tmp/voyage_lru.pkl",
+                                  save_frequency=200)
+    # similarity = UnixcoderSimilarity(model_name="microsoft/unixcoder-base", device="cuda")
     benchmark = RepobenchRetriever()
     benchmark.load_dataset()
     test_result = benchmark.retrieve_test(settings, similarity)
     import json
-    with open("results/retrieval/unixcoder-base_cosine/python.json", "w") as f:
+    with open("results/retrieval/unixcoder-base_cosine/python2.json", "w") as f:
         json.dump(test_result, f)
     del test_result
-    with open("results/retrieval/unixcoder-base_cosine/python.json", "r") as f:
+    with open("results/retrieval/unixcoder-base_cosine/python2.json", "r") as f:
         test_result = json.load(f)
     eval_result = benchmark.retrieve_eval(test_result, print_random=True)
     logger.success(eval_result)
