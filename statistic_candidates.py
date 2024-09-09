@@ -1,8 +1,24 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from datasets import load_dataset
 from loguru import logger
 from run_repobench_r import Dataset, load_data
 from tqdm import tqdm
+
+
+def load_data_parquet(dataset_path: str = "samples",
+                      tasks: list[str] = ["test_easy", "test_hard"],
+                      subsets: list[str] = ["python_cff", "python_cfr"],
+                      SAMPLES: int = 60) -> dict[str, dict[str, Dataset]]:
+    datasets = {}
+    for subset_name in subsets:
+        datasets[subset_name] = {}
+        for task_name in tasks:
+            datasets[subset_name][task_name] = \
+                load_dataset("parquet",
+                             data_files=f"{dataset_path}/{subset_name}_{task_name}_sample_{SAMPLES}.parquet")["train"]
+
+    return datasets
 
 
 def statistic(dataset: Dataset):
@@ -31,16 +47,21 @@ def draw(data: list[int], filename: str, xlabel: str, log=False):
 
 
 def main():
-    datasets = load_data()
+    # datasets = load_data()
+    datasets = load_data_parquet()
     for subset_name, subset_data in datasets.items():
         logger.success(f"Processing {subset_name}")
         for task_name, task_set in subset_data.items():
             logger.success(f"In task {task_name}")
             lines, counts, str_length = statistic(task_set)
-            draw(lines, f"{subset_name}_{task_name}_lines", xlabel=f"{subset_name}_{task_name}_lines", log=True)
-            draw(str_length, f"{subset_name}_{task_name}_str_length",
+            draw(lines, f"samples_{subset_name}_{task_name}_lines",
+                 xlabel=f"{subset_name}_{task_name}_lines", log=True)
+
+            draw(str_length, f"samples_{subset_name}_{task_name}_str_length",
                  xlabel=f"{subset_name}_{task_name}_str_length", log=True)
-            draw(counts, f"{subset_name}_{task_name}_candidate_counts", xlabel=f"{subset_name}_{task_name}_candidate_counts")
+
+            draw(counts, f"samples_{subset_name}_{task_name}_candidate_counts",
+                 xlabel=f"{subset_name}_{task_name}_candidate_counts")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ def main():
         for task_name, task_set in subset_data.items():
             logger.success(f"In task {task_name}")
             selected_index, selected_dataset = sample_dataset(task_set, selects=SAMPLES)
-            selected_dataset.to_parquet(f"{subset_name}_{task_name}_sample_{SAMPLES}.parquet")
+            selected_dataset.to_parquet(f"samples/{subset_name}_{task_name}_sample_{SAMPLES}.parquet")
             indexes[subset_name][task_name] = {}
             indexes[subset_name][task_name]["index"] = selected_index
             indexes[subset_name][task_name]["repo_name"] = selected_dataset['repo_name']
