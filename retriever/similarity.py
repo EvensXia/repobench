@@ -6,12 +6,11 @@ from typing import Union
 import math
 
 
-
 def edit_similarity(
-    code1: Union[str, list], 
-    code2: Union[str, list], 
+    code1: Union[str, list],
+    code2: Union[str, list],
     tokenizer: AutoTokenizer = None
-    ) -> float:
+) -> float:
 
     # Check input types and tokenize as needed
     if isinstance(code1, str):
@@ -28,13 +27,13 @@ def edit_similarity(
 
     # compute and return the similarity ratio
     return SequenceMatcher(None, code1, code2).ratio()
-    
+
 
 def jaccard_similarity(
     code1: Union[str, list],
     code2: Union[str, list],
     tokenizer: AutoTokenizer = None
-    ) -> float:
+) -> float:
 
     # Check input types and tokenize/de-duplicate as needed
     if isinstance(code1, str):
@@ -57,11 +56,10 @@ def jaccard_similarity(
         return 0
 
 
-
 def cosine_similarity(
         embedding1,
         embedding2
-        ):
+):
     """
     Calculate the cosine similarity between two embeddings
     """
@@ -71,3 +69,18 @@ def cosine_similarity(
 
     # calculate the cosine similarity
     return torch.cosine_similarity(embedding1, embedding2, dim=0).item()
+
+
+if __name__ == "__main__":
+    tokenizer = AutoTokenizer.from_pretrained("Salesforce/codegen-350M-multi", cache_dir="cache")
+    test1 = ["", ["sdasd", "", "dassfasdg4"]]
+    test2 = ["sdasd", ["sdasd", "", "dassfasdg4"]]
+    test3 = ["sdasd", ["sdasd", "", "dassfasdg4"]]
+    test4 = ["sdasd", ["sdasd", "dassfasdg4"]]
+    for i, test in enumerate([test1, test2, test3, test4]):
+        code = test[0]
+        candidate = test[1]
+        print(f"test_{i+1}", code, candidate)
+        print("jaccard_similarity:", [jaccard_similarity(code, candidatei, tokenizer) for candidatei in candidate])
+        print("edit_similarity:", [edit_similarity(code, candidatei, tokenizer) for candidatei in candidate])
+        print("")

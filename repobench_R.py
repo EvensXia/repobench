@@ -1,16 +1,25 @@
+import asyncio
+import atexit
 import hashlib
+import json
 import os
 import pickle
 import random
+import re
 import sys
+from abc import abstractmethod
 from dataclasses import dataclass
 # NOTE: if in py311 or lower, should install with `python -m pip install difflib`
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 from datasets import Dataset, load_dataset
 from loguru import logger
+from metagpt.config2 import Config
+from metagpt.llm import LLM
+from metagpt.provider.base_llm import BaseLLM
 from tqdm import tqdm
 from transformers import (AutoModel, AutoTokenizer, PreTrainedModel,
                           PreTrainedTokenizer, RobertaConfig, RobertaModel,
@@ -42,9 +51,8 @@ def accuracy_at_k(prediction_list: list[list[int]], golden_index_list: list[int]
 
     return round(acc / len(golden_index_list), 5)
 
+
 # copy from repobench model/unixcoder
-
-
 class UniXcoder(nn.Module):
     def __init__(self, model_name):
         """
@@ -297,6 +305,51 @@ class Settings:
     keep_lines: list[int]  # the lines to keep, e.g., [3, 10]
 
 
+class CacheMixin:
+    def __init__(self, cache_file: str = "/tmp/cache.pkl", save_frequency: int = 200) -> None:
+        self.cache_file = cache_file
+        self.cache = self._load_cache()
+        self.call_count = 0
+        self.save_frequency = save_frequency
+        # Register the atexit function to save cache when the program exits
+        atexit.register(self._save_cache_on_exit)
+
+    def _generate_cache_key(self, code: str, candidates: list[str]) -> str:
+        key = code + ''.join(candidates)
+        return hashlib.md5(key.encode()).hexdigest()
+
+    def _load_cache(self) -> dict:
+        if os.path.exists(self.cache_file):
+            with open(self.cache_file, 'rb') as f:
+                try:
+                    return pickle.load(f)
+                except (EOFError, pickle.UnpicklingError):
+                    logger.warning("Failed to load cache file, starting with an empty cache.")
+                    return {}
+        else:
+            return {}
+
+    def _save_cache(self) -> None:
+        with open(self.cache_file, 'wb') as f:
+            pickle.dump(self.cache, f)
+
+    def _save_cache_on_exit(self) -> None:
+        logger.info(f"Saving cache to {self.cache_file} before program exits")
+        self._save_cache()
+
+    def _cache_retrieve(self, cache_key: str): return self.cache.get(cache_key)
+
+    def _cache_store(self, cache_key: str, value: list[int]) -> None:
+        self.cache[cache_key] = value
+        self.call_count += 1
+        if self.call_count >= self.save_frequency:
+            logger.info(f"Saving cache to {self.cache_file} after {self.save_frequency} calls")
+            self._save_cache()
+            self.call_count = 0
+
+    def __del__(self): self._save_cache_on_exit()
+
+
 class Similarity:
     def retrieve(self, code: str, candidates: list[str]) -> list[int]:
         sim_scores = []
@@ -308,7 +361,23 @@ class Similarity:
         ranks = [index for index, score in sim_scores]
         return ranks
 
+    @abstractmethod
     def similarity(self, code1: str | list, code2: str | list) -> float: raise NotImplementedError
+
+
+class AsyncSimilarity:
+    async def retrieve(self, code: str, candidates: list[str]) -> list[int]:
+        sim_scores = []
+        for i, candidate in enumerate(candidates):
+            sim_scores.append((i, self.similarity(code, candidate)))
+        # sort the candidate index based on the edit similarity in a descending order
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        # only return the index
+        ranks = [index for index, score in sim_scores]
+        return ranks
+
+    @abstractmethod
+    async def similarity(self, code1: str | list, code2: str | list) -> float: raise NotImplementedError
 
 
 class EditSimilarity(Similarity):
@@ -353,6 +422,7 @@ class JaccardSimilarity(EditSimilarity):
 
 
 class CosineSimilarityBase(Similarity):
+    @abstractmethod
     def _get_max_length(self) -> int: raise NotImplementedError
 
     def __init__(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, device: str | torch.device | int) -> None:
@@ -447,8 +517,9 @@ class UnixcoderSimilarity(CosineSimilarityBase):
         return code_embeddings
 
 
-class VoyageSimilarity(Similarity):
+class VoyageSimilarity(Similarity, CacheMixin):
     def __init__(self, api_key: str, model: str = "voyage-code-2", cache_file: str = "/tmp/voyage_lru.pkl", save_frequency: int = 200) -> None:
+        CacheMixin.__init__(self, cache_file, save_frequency)
         try:
             import voyageai
         except ImportError:
@@ -456,60 +527,156 @@ class VoyageSimilarity(Similarity):
             sys.exit(1)
         self.vo = voyageai.Client(api_key)
         self.model = model
-        self.cache_file = cache_file
-        self.cache = self._load_cache()
-        self.call_count = 0
-        self.save_frequency = save_frequency
-
-    def _generate_cache_key(self, code: str, candidates: list[str]) -> str:
-        key = code + ''.join(candidates)
-        return hashlib.md5(key.encode()).hexdigest()
-
-    def _load_cache(self) -> dict:
-        if os.path.exists(self.cache_file):
-            with open(self.cache_file, 'rb') as f:
-                try:
-                    return pickle.load(f)
-                except (EOFError, pickle.UnpicklingError):
-                    logger.warning("Failed to load cache file, starting with an empty cache.")
-                    return {}
-        else:
-            return {}
-
-    def _save_cache(self) -> None:
-        with open(self.cache_file, 'wb') as f:
-            pickle.dump(self.cache, f)
 
     def retrieve(self, code: str, candidates: list[str]) -> list[int]:
-        cache_key = self._generate_cache_key(code, candidates)
-        if cache_key in self.cache:
-            logger.info("Cache hit")
-            return self.cache[cache_key]
+        if code == "":
+            sim_scores = [(i, len(candidate[:1000]) / 100) for i, candidate in enumerate(candidates)]
+            sim_scores = sorted(sim_scores, key=lambda x: x[1])
+        else:
+            cache_key = self._generate_cache_key(code, candidates)
+            cached_result = self._cache_retrieve(cache_key)
+            if cached_result:
+                logger.info("Cache hit")
+                return cached_result
+            code_embedding: list[float] = self.vo.embed([code], model=self.model, truncation=True).embeddings[0]
+            # switch to get in queue to avoid total length over limit
+            candidates_embeddings: list[list[float]] = [self.vo.embed([candidate],
+                                                                      model=self.model,
+                                                                      truncation=True).embeddings[0]
+                                                        for candidate in candidates]
+            sim_scores = [(i, self.similarity(code_embedding, candidate_embedding))
+                          for i, candidate_embedding in enumerate(candidates_embeddings)]
+            sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        ranks = [index for index, _ in sim_scores]
 
-        embeddings = self.vo.embed([code, *candidates], model=self.model).embeddings
-        code_embedding: list[float] = embeddings[0]
-        candidates_embeddings: list[list[float]] = embeddings[1:]
-        sim_scores = []
-        for i, candidate_embedding in enumerate(candidates_embeddings):
-            sim_scores.append((i, self.similarity(code_embedding, candidate_embedding)))
-        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-        ranks = [index for index, score in sim_scores]
-
-        self.cache[cache_key] = ranks
-        self.call_count += 1
-
-        if self.call_count >= self.save_frequency:
-            logger.info(f"Saving cache to {self.cache_file} after {self.save_frequency} calls")
-            self._save_cache()
-            self.call_count = 0
-
+        self._cache_store(cache_key, ranks)
         return ranks
 
     def similarity(self, embedding1: list[float], embedding2: list[float]) -> float:
         return torch.cosine_similarity(torch.tensor(embedding1), torch.tensor(embedding2), dim=0).item()
 
 
+class LLMSimilarityBase(AsyncSimilarity):
+    @abstractmethod
+    def _prompt(self): raise NotImplementedError
+
+    def __init__(self, llm: BaseLLM) -> None:
+        self.llm: BaseLLM = llm
+        self.prompt: str = self._prompt()
+
+    def clean_and_extract_numbers(self, result: str): return ' '.join(re.sub(r'[^0-9]', ' ', result).split())
+
+
+class ListwiseLLMSimilarity(LLMSimilarityBase, CacheMixin):
+    def _prompt(self) -> str: return """\
+You will be given a code snippet and multiple candidates. Your task is to evaluate each candidate based on its relevance to the provided code. The higher the relevance between the candidate and the code, the higher the score should be. You must output an integer score between 0 and 100 for each candidate, where 0 is completely irrelevant and 100 is perfectly relevant. The scores must be separated by a single space, and no additional text should be included in your output.
+
+Code:
+
+{code}
+
+Candidates:
+
+{candidates}
+
+Output the scores in the format: `score1 score2 score3 ...`
+"""
+
+    def __init__(self, llm: BaseLLM, cache_file: str = "/tmp/llm_listwise_cache.pkl", save_frequency: int = 200) -> None:
+        LLMSimilarityBase.__init__(self, llm)
+        CacheMixin.__init__(self, cache_file, save_frequency)
+
+    async def retrieve(self, code: str, candidates: list[str]) -> list[int]:
+        cache_key = self._generate_cache_key(code, candidates)
+        if code == "":
+            sim_scores = [(i, len(candidate[:1000]) / 100) for i, candidate in enumerate(candidates)]
+            sim_scores = sorted(sim_scores, key=lambda x: x[1])
+        else:
+            cached_result = self._cache_retrieve(cache_key)
+            if cached_result:
+                logger.info("Cache hit")
+                return cached_result
+            sim_scores_bn = [0]*len(candidates)
+            non_empty_indices = [index for index, string in enumerate(candidates) if string]
+            non_empty_list = [candidates[i] for i in non_empty_indices]
+
+            candidates_str = "\n\n".join([f"{i+1}.\n{cand}" for i, cand in enumerate(non_empty_list)])
+            prompt = self.prompt.format(code=code, candidates=candidates_str)
+            try:
+                output = await self.llm.aask(msg=prompt)
+            except:
+                output = ""
+            clear_output = self.clean_and_extract_numbers(output)
+            ret = clear_output.split()
+            if len(ret) == len(non_empty_list):
+                sub_sim_scores = [int(i) for i in ret]
+                for idx, sub_score in zip(non_empty_indices, sub_sim_scores):
+                    sim_scores_bn[idx] = sub_score
+            else:
+                logger.warning(f"LLM({self.llm.__class__.__name__}) returned an unsupported response: \n{output}\n\
+                                assuming all values are `0`")
+            sim_scores = [(i, score) for i, score in enumerate(sim_scores_bn)]
+            sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        ranks = [index for index, score in sim_scores]
+
+        self._cache_store(cache_key, ranks)
+        return ranks
+
+
+class PointwiseLLMSimilarity(LLMSimilarityBase, CacheMixin):
+    def _prompt(self): return """\
+You will be given a code snippet and one candidate. Your task is to evaluate the candidate based on its relevance to the provided code. The higher the relevance between the candidate and the code, the higher the score should be. You must output an integer score between 0 and 100, where 0 is completely irrelevant and 100 is perfectly relevant. Your output must only be a single number with no additional text.
+
+Code:
+
+{code}
+
+Candidate:
+
+{candidate}
+
+Output the score as **a single integer**.
+"""
+
+    def __init__(self, llm: BaseLLM, cache_file: str = "/tmp/llm_pointwise_cache.pkl", save_frequency: int = 200) -> None:
+        LLMSimilarityBase.__init__(self, llm)
+        CacheMixin.__init__(self, cache_file, save_frequency)
+
+    async def retrieve(self, code: str, candidates: list[str]) -> list[int]:
+        if code == "":
+            sim_scores = [(i, len(candidate[:1000]) / 100) for i, candidate in enumerate(candidates)]
+            sim_scores = sorted(sim_scores, key=lambda x: x[1])
+        else:
+            sim_scores = []
+            for ci, candidate in enumerate(candidates):
+                cache_key = self._generate_cache_key(code, [candidate])
+                if candidate == "":
+                    score = 0
+                else:
+                    cached_result = self._cache_retrieve(cache_key)
+                    if cached_result:
+                        logger.info("Cache hit")
+                        sim_scores.append((ci, cached_result[0]))
+                        continue
+                    prompt = self.prompt.format(code=code, candidate=candidate)
+                    output = await self.llm.aask(msg=prompt)
+                    clear_output = self.clean_and_extract_numbers(output)
+                    ret = clear_output.split()
+                    if len(ret) == 1:
+                        score = int(ret[0])
+                    else:
+                        score = 0
+                        logger.warning(f"LLM({self.llm.__class__.__name__}) returned an unsupported response: \n{output}\n\
+                                        assuming `0`")
+                sim_scores.append((ci, score))
+                self._cache_store(cache_key, [score])
+            sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        ranks = [index for index, score in sim_scores]
+        return ranks
+
+
 class Repobench:
+    @abstractmethod
     def _get_languages(self): raise NotImplementedError
 
     def __init__(self, subsets: list[str], tasks: list[str], dataset_path: str) -> None:
@@ -528,9 +695,23 @@ class Repobench:
             for task in self.tasks:
                 self.datasets[subset][task] = dataset[task]
 
-    def retrieve_test(self, settings: Settings, similarity: Similarity) -> dict[str, dict[str, list]]: raise NotImplementedError
+    def load_data_parquet(self, samples_tag: int = 60):
+        for subset in self.subsets:
+            self.datasets[subset] = {}
+            for task_name in self.tasks:
+                self.datasets[subset][task_name] = load_dataset("parquet",
+                                                                data_files=f"{self.dataset_path}/"
+                                                                f"{subset}_{task_name}_sample_"
+                                                                f"{samples_tag}.parquet")["train"]
 
+    @abstractmethod
+    def retrieve_test(self, settings: Settings, similarity: Similarity) -> dict[str, dict[str, list]]: raise NotImplementedError
+    @abstractmethod
     def retrieve_eval(self, test_result: dict[str, dict[str, list]], print_random: bool) -> dict: raise NotImplementedError
+
+    @abstractmethod
+    async def async_retrieve_test(self, settings: Settings, similarity: AsyncSimilarity) -> dict[str, dict[str, list]]:
+        raise NotImplementedError
 
 
 class RepobenchRetriever(Repobench):
@@ -556,7 +737,28 @@ class RepobenchRetriever(Repobench):
                     for i in settings.keep_lines:
                         code = crop_code_lines(dic['code'], i)
                         candidates = dic['context']
-                        res_dic[i] = similarity.retrieve(code, candidates)
+                        res_dic[str(i)] = similarity.retrieve(code, candidates)
+                    res_dic['ground_truth'] = dic['gold_snippet_index']
+                    res[task_name].append(res_dic)
+            all_result[subset_name] = res
+        return all_result
+
+    async def async_retrieve_test(self, settings: Settings, similarity: AsyncSimilarity) -> dict[str, dict[str, list]]:
+        logger.info(f"async_retrieve in settings: {settings}, similarity using `{similarity.__class__.__name__}`")
+        all_result: dict[str, dict[str, list]] = {}
+        for subset_name, subset_data in self.datasets.items():
+            logger.success(f"Processing `{subset_name}`")
+            res: dict[str, list] = {}
+            i = 0
+            for task_name, task_set in subset_data.items():
+                logger.success(f"In task `{task_name}`")
+                res[task_name] = []
+                for dic in tqdm(task_set, desc=f"running at {task_name}"):
+                    res_dic = {}
+                    for i in settings.keep_lines:
+                        code = crop_code_lines(dic['code'], i)
+                        candidates = dic['context']
+                        res_dic[str(i)] = await similarity.retrieve(code, candidates)
                     res_dic['ground_truth'] = dic['gold_snippet_index']
                     res[task_name].append(res_dic)
             all_result[subset_name] = res
@@ -606,9 +808,9 @@ class RepobenchRetriever(Repobench):
         for i in range(100):
             rd_acc_at_1.append(accuracy_at_k(rd[i], gt, k=1) * 100)
             rd_acc_at_3.append(accuracy_at_k(rd[i], gt, k=3) * 100)
-            if test_type == "test_hard":
+            if test_type in ["test_easy", "test_hard"]:
                 rd_acc_at_5.append(accuracy_at_k(rd[i], gt, k=5) * 100)
-        if test_type == "test_hard":
+        if test_type in ["test_easy", "test_hard"]:
             rd_accs = [
                 sum(rd_acc_at_1) / len(rd_acc_at_1),
                 sum(rd_acc_at_3) / len(rd_acc_at_3),
@@ -626,7 +828,7 @@ class RepobenchRetriever(Repobench):
             if pred_list:
                 acc_at_1 = accuracy_at_k(pred_list, gt, k=1) * 100
                 acc_at_3 = accuracy_at_k(pred_list, gt, k=3) * 100
-                if test_type == "test_hard":
+                if test_type in ["test_easy", "test_hard"]:
                     acc_at_5 = accuracy_at_k(pred_list, gt, k=5) * 100
                     rec = [acc_at_1, acc_at_3, acc_at_5]
                 else:
@@ -655,19 +857,23 @@ class RepobenchRetriever(Repobench):
                     ...
 
 
+class SubRepobenchRetriever(RepobenchRetriever):
+    def __init__(self, dataset_path: str) -> None:
+        Repobench.__init__(self,
+                           ["python_cff", "python_cfr"],
+                           ["test_easy", "test_hard"],
+                           dataset_path)
+
+
 def demo():
-    settings = Settings(keep_lines=[3])
+    settings = Settings(keep_lines=[3])  # NOTE: keep this setting in default
     # similarity = EditSimilarity()  # using "Salesforce/codegen-350M-multi" tokenizer
     # similarity = JaccardSimilarity()  # using "Salesforce/codegen-350M-multi" tokenizer
-    similarity = VoyageSimilarity(api_key="pa-Iij_g89x-bEwr0KXcFuW8gFoqyDVXZ_DZggOKiZROUY",
-                                  model="voyage-code-2",
-                                  cache_file="/tmp/voyage_lru.pkl",
-                                  save_frequency=200)
-    # similarity = UnixcoderSimilarity(model_name="microsoft/unixcoder-base", device="cuda")
+    # similarity = VoyageSimilarity(api_key=os.getenv("VOYAGE_KEY"))
+    similarity = UnixcoderSimilarity(model_name="microsoft/unixcoder-base", device="cuda")
     benchmark = RepobenchRetriever()
     benchmark.load_dataset()
     test_result = benchmark.retrieve_test(settings, similarity)
-    import json
     with open("results/retrieval/unixcoder-base_cosine/python2.json", "w") as f:
         json.dump(test_result, f)
     del test_result
@@ -677,5 +883,51 @@ def demo():
     logger.success(eval_result)
 
 
+async def subset_tasks():
+    save_out_dir = "test_results"
+    settings = Settings(keep_lines=[3])  # NOTE: keep this setting in default
+    benchmark = SubRepobenchRetriever(dataset_path="samples")
+    benchmark.load_data_parquet(samples_tag=60)
+    bench = benchmark.__class__.__name__
+    os.makedirs(f"{save_out_dir}/{bench}", exist_ok=True)
+    config2 = Path(os.path.join(os.path.expanduser("~"), ".metagpt", "config2.yaml"))
+    llm_config = Config.from_yaml_file(config2).llm
+    llm: BaseLLM = LLM(llm_config=llm_config)
+    similarities: list[Similarity | AsyncSimilarity] = [
+        EditSimilarity(),  # in paper
+        JaccardSimilarity(),  # in paper
+        UnixcoderSimilarity(model_name="microsoft/unixcoder-base", device="cuda"),  # in paper
+        ListwiseLLMSimilarity(llm=llm),
+        PointwiseLLMSimilarity(llm=llm),
+        VoyageSimilarity(api_key=os.getenv("VOYAGE_KEY")),
+    ]
+
+    for similarity in similarities:
+        simi = similarity.__class__.__name__
+        logger.success(f"TESTING Similarity = {simi}")
+        if os.path.exists(f"{save_out_dir}/{bench}/{simi}.retrieve_test.json"):
+            with open(f"{save_out_dir}/{bench}/{simi}.retrieve_test.json", "r") as f:
+                test_result = json.load(f)
+            logger.success(f"Loaded Similarity = {simi} test_result = `{save_out_dir}/{bench}/{simi}.retrieve_test.json`")
+        else:
+            if issubclass(similarity.__class__, AsyncSimilarity):
+                test_result = await benchmark.async_retrieve_test(settings, similarity)
+            elif issubclass(similarity.__class__, Similarity):
+                test_result = benchmark.retrieve_test(settings, similarity)
+            else:
+                logger.info(f"not support Similarity type `{simi}`")
+                continue
+            with open(f"{save_out_dir}/{bench}/{simi}.retrieve_test.json", "w") as f:
+                json.dump(test_result, f, indent=4)
+            logger.success(f"Writed Similarity = {simi} test_result = `{save_out_dir}/{bench}/{simi}.retrieve_test.json`")
+
+        eval_result = benchmark.retrieve_eval(test_result, print_random=True)
+        logger.success(eval_result)
+        with open(f"{save_out_dir}/{bench}/{simi}.retrieve_eval.json", "w") as f:
+            json.dump(eval_result,  f, indent=4)
+        logger.success(f"Writed Similarity = {simi} eval_result = `{save_out_dir}/{bench}/{simi}.retrieve_eval.json`")
+        logger.success(f"FINISH {simi}")
+
+
 if __name__ == "__main__":
-    demo()
+    asyncio.run(subset_tasks())

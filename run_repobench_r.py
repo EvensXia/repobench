@@ -25,6 +25,22 @@ def load_data(dataset_path: str = "tianyang/repobench-r",
     return datasets
 
 
+def load_data_parquet(dataset_path: str = "samples",
+                      tasks: list[str] = ["test_easy", "test_hard"],
+                      subsets: list[str] = ["python_cff", "python_cfr"],
+                      SAMPLES: int = 60) -> dict[str, dict[str, Dataset]]:
+    datasets = {}
+    for subset_name in subsets:
+        datasets[subset_name] = {}
+        for task_name in tasks:
+            datasets[subset_name][task_name] = load_dataset("parquet",
+                                                            data_files=f"{dataset_path}/"
+                                                            f"{subset_name}_{task_name}_sample_"
+                                                            f"{SAMPLES}.parquet")["train"]
+
+    return datasets
+
+
 def main(
     similarity: str,  # the similarity used to retrieve, e.g., cosine, edit, jaccard
     keep_lines: list,  # the lines to keep, e.g., [3, 10]

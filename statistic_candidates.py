@@ -1,24 +1,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from datasets import load_dataset
 from loguru import logger
-from run_repobench_r import Dataset, load_data
+from run_repobench_r import Dataset, load_data, load_data_parquet
 from tqdm import tqdm
-
-
-def load_data_parquet(dataset_path: str = "samples",
-                      tasks: list[str] = ["test_easy", "test_hard"],
-                      subsets: list[str] = ["python_cff", "python_cfr"],
-                      SAMPLES: int = 60) -> dict[str, dict[str, Dataset]]:
-    datasets = {}
-    for subset_name in subsets:
-        datasets[subset_name] = {}
-        for task_name in tasks:
-            datasets[subset_name][task_name] = \
-                load_dataset("parquet",
-                             data_files=f"{dataset_path}/{subset_name}_{task_name}_sample_{SAMPLES}.parquet")["train"]
-
-    return datasets
 
 
 def statistic(dataset: Dataset):
